@@ -40,33 +40,39 @@ code change.
 ## System Flow
 
 1. **Webhook Ingestion**
-   Client systems send events to Amazon API Gateway.
+   Source systems send events to Amazon API Gateway via POST /webhooks.
+   API Gateway stamps every request with a requestId (used as correlation_id).
 
-2. **Request Handler**
-   The request is processed by AWS Lambda (Ingest Service):
+2. **Authentication**
+   - API Gateway invokes a Lambda authoriser before any other processing.
+   - The authoriser gets the X-API-Key header and checks it in
+     DynamoDB. Returns Allow or Deny to API Gateway.
+
+3. **Request Handler**
+   The Authorised requests is processed by AWS Lambda (Ingest Service):
    - Input validation
    - Message ID generation
    - Idempotency check
-   - Attach correlation_id
 
-3. **Queueing (Priority-Based)**
+4. **Queueing (Priority-Based)**
    Messages are routed to Amazon SQS FIFO queues:
    - P1 - High priority
    - P2 - Medium priority
    - P3 - Low priority
 
-4. **Processing**
+5. **Processing**
    A worker (Lambda) processes messages using:
    - Priority-first polling (P1 then P2 then P3)
    - FIFO ordering within each queue
+   - message_id checked in DynamoDB before processing, to prevent duplicate delvery
 
-5. **Data Enrichment**
+6. **Data Enrichment**
    Additional data (customer, product) is fetched before delivery.
 
-6. **Delivery**
+7. **Delivery**
    The enriched payload is sent to Salesforce.
 
-7. **Failure Handling**
+8. **Failure Handling**
    Failed messages are retried with exponential backoff and eventually moved to a Dead Letter Queue (DLQ).
 
 ---
