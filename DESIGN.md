@@ -5,7 +5,7 @@
 ## The Problem
 
 Multiple source systems (order management, inventory, third-party applications)
-need to notify a downstream Salesforce system when data changes and should be processed according to message priorit.
+need to notify a downstream Salesforce system when data changes and should be processed according to message priority.
 
 Building direct integrations between each system would lead to tight coupling, increased maintenance overhead and complexity.
 
@@ -42,11 +42,12 @@ code change.
 1. **Webhook Ingestion**
    Client systems send events to Amazon API Gateway.
 
-2. **Request Handling**
+2. **Request Handler**
    The request is processed by AWS Lambda (Ingest Service):
    - Input validation
    - Message ID generation
    - Idempotency check
+   - Attach correlation_id
 
 3. **Queueing (Priority-Based)**
    Messages are routed to Amazon SQS FIFO queues:
@@ -156,4 +157,4 @@ in CloudWatch Logs Insights with a single query.
 
 See [README.md](README.md) for setup and run instructions.
 
-API schema: [openapi.yaml](openapi.yaml)
+<!-- API schema: [openapi.yaml](openapi.yaml) -->
