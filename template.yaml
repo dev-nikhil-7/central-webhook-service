@@ -1,0 +1,343 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Central Webhook Service — SAM Template
+#
+# Deploys:
+#   - 3 DynamoDB tables
+#   - 8 SQS queues (P1/P2/P3/DLQ per consumer)
+#   - 3 Lambda functions (authoriser, ingest, processor)
+#   - API Gateway with Lambda authoriser
+#   - SQS event source mappings
+#
+# Deploy:
+#   sam build
+#   sam deploy --guided
+# ─────────────────────────────────────────────────────────────────────────────
+
+Description: Central Webhook Service
+
+# ─── Parameters ──────────────────────────────────────────────────────────────
+# Values you can override at deploy time
+# sam deploy --parameter-overrides SalesforceUrl=https://...
+
+Parameters:
+  SalesforceUrl:
+    Type: String
+    Description: URL to deliver enriched webhooks to
+    Default: https://webhook.site/test
+
+  Environment:
+    Type: String
+    Description: Deployment environment
+    Default: dev
+    AllowedValues: [dev]
+
+# ─── Globals ─────────────────────────────────────────────────────────────────
+# Settings applied to ALL Lambda functions
+# Saves repeating them on every function
+
+Globals:
+  Function:
+    Runtime: python3.14
+    Architectures: [x86_64]
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        # These env vars are available in every Lambda function
+        AWS_ACCOUNT_ID: !Ref AWS::AccountId
+        DYNAMO_CONSUMERS_TABLE: !Ref ConsumersTable
+        DYNAMO_IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+        DYNAMO_MESSAGES_TABLE: !Ref MessagesTable
+        SALESFORCE_URL: !Ref SalesforceUrl
+        ENVIRONMENT: !Ref Environment
+
+Resources:
+  # =============================================================================
+  # DYNAMODB TABLES
+  # Three tables — auth, idempotency, audit
+  # =============================================================================
+
+  # Stores registered consumers and their hashed API keys
+  # Used by: authoriser Lambda
+  ConsumersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub webhook-consumers-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: api_key_hash
+          AttributeType: S
+      KeySchema:
+        - AttributeName: api_key_hash
+          KeyType: HASH
+
+  # Stores idempotency keys to prevent duplicate ingestion
+  # Used by: ingest Lambda
+  # TTL enabled — keys auto-expire after 7 days
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub webhook-idempotency-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: idempotency_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: idempotency_key
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Audit trail — every message and its delivery status
+  # Used by: ingest Lambda (write) and processor Lambda (update)
+  MessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub webhook-messages-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: message_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: message_id
+          KeyType: HASH
+
+  # =============================================================================
+  # SQS QUEUES
+  # One set per consumer (order-mgmt)
+  # DLQ created first — other queues reference its ARN
+  # =============================================================================
+
+  # Dead letter queue — receives messages after 5 failed attempts
+  OrderMgmtDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub order-mgmt-dlq-${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      # Keep failed messages for 14 days for investigation
+      MessageRetentionPeriod: 1209600
+
+  # P1 — Critical priority
+  # Reserved concurrency set higher than P2/P3
+  # Messages here processed first under load
+  OrderMgmtP1:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub order-mgmt-p1-${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderMgmtDLQ.Arn
+        maxReceiveCount: 5
+
+  # P2 — Normal priority
+  OrderMgmtP2:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub order-mgmt-p2-${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderMgmtDLQ.Arn
+        maxReceiveCount: 5
+
+  # P3 — Low priority
+  OrderMgmtP3:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub order-mgmt-p3-${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderMgmtDLQ.Arn
+        maxReceiveCount: 5
+
+  # =============================================================================
+  # IAM ROLE
+  # Shared by all three Lambda functions
+  # =============================================================================
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub webhook-lambda-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Write logs to CloudWatch
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WebhookServicePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # DynamoDB — all three tables
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ConsumersTable.Arn
+                  - !GetAtt IdempotencyTable.Arn
+                  - !GetAtt MessagesTable.Arn
+              # SQS — all queues
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource:
+                  - !GetAtt OrderMgmtP1.Arn
+                  - !GetAtt OrderMgmtP2.Arn
+                  - !GetAtt OrderMgmtP3.Arn
+                  - !GetAtt OrderMgmtDLQ.Arn
+
+  # =============================================================================
+  # LAMBDA FUNCTIONS
+  # Three functions — all use same code, different handlers
+  # =============================================================================
+
+  # Authoriser — called by API Gateway before every request
+  # Hashes X-API-Key and looks up in DynamoDB
+  # Returns Allow or Deny policy
+  AuthoriserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub webhook-authoriser-${Environment}
+      CodeUri: src/
+      Handler: authoriser.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      Description: Validates API keys for incoming webhook requests
+
+  # Ingest — triggered by API Gateway after authoriser allows
+  # Validates request, checks idempotency, enqueues to SQS
+  # Returns 202 immediately — does not wait for processing
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub webhook-ingest-${Environment}
+      CodeUri: src/
+      Handler: ingest_handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Description: Receives webhooks and routes to priority queues
+      Events:
+        WebhookPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref WebhookApi
+            Path: /webhooks
+            Method: POST
+
+  # Processor — triggered by SQS event source mapping
+  # Enriches message with customer/product data
+  # Delivers to Salesforce
+  # Returns batchItemFailures for partial retry
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub webhook-processor-${Environment}
+      CodeUri: src/
+      Handler: processor.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Description: Processes queued webhooks and delivers to Salesforce
+      # SQS triggers — one per priority queue
+      # P1 gets higher reserved concurrency than P2/P3
+      # This is weighted priority — P1 drains faster under load
+      Events:
+        P1Trigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrderMgmtP1.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+        P2Trigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrderMgmtP2.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+        P3Trigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrderMgmtP3.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  # =============================================================================
+  # API GATEWAY
+  # REST API with Lambda authoriser
+  # =============================================================================
+
+  WebhookApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub webhook-service-${Environment}
+      StageName: !Ref Environment
+      Description: Central Webhook Service API
+      Auth:
+        DefaultAuthorizer: WebhookKeyAuthoriser
+        Authorizers:
+          WebhookKeyAuthoriser:
+            FunctionArn: !GetAtt AuthoriserFunction.Arn
+            Identity:
+              Header: X-API-Key
+              ReauthorizeEvery: 300
+
+# =============================================================================
+# OUTPUTS
+# Printed after sam deploy completes
+# These are the values you need to test
+# =============================================================================
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/webhooks
+
+  AuthoriserFunctionArn:
+    Description: Lambda Authoriser ARN
+    Value: !GetAtt AuthoriserFunction.Arn
+
+  IngestFunctionArn:
+    Description: Ingest Lambda ARN
+    Value: !GetAtt IngestFunction.Arn
+
+  ProcessorFunctionArn:
+    Description: Processor Lambda ARN
+    Value: !GetAtt ProcessorFunction.Arn
+
+  ConsumersTableName:
+    Description: DynamoDB consumers table name
+    Value: !Ref ConsumersTable
+
+  P1QueueUrl:
+    Description: SQS P1 queue URL
+    Value: !Ref OrderMgmtP1
+
+  DLQUrl:
+    Description: Dead letter queue URL
+    Value: !Ref OrderMgmtDLQ

@@ -1,0 +1,13 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "sam-app"
+resolve_s3 = true
+s3_prefix = "sam-app"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "SalesforceUrl=\"\thttps://webhook.site/ad43e7e4-e274-424f-b7bf-f762a5b2f1b9\" Environment=\"dev\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"

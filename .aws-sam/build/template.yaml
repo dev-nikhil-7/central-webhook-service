@@ -1,0 +1,319 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Central Webhook Service
+Parameters:
+  SalesforceUrl:
+    Type: String
+    Description: URL to deliver enriched webhooks to
+    Default: https://webhook.site/test
+  Environment:
+    Type: String
+    Description: Deployment environment
+    Default: dev
+    AllowedValues:
+    - dev
+Globals:
+  Function:
+    Runtime: python3.14
+    Architectures:
+    - x86_64
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        AWS_ACCOUNT_ID:
+          Ref: AWS::AccountId
+        DYNAMO_CONSUMERS_TABLE:
+          Ref: ConsumersTable
+        DYNAMO_IDEMPOTENCY_TABLE:
+          Ref: IdempotencyTable
+        DYNAMO_MESSAGES_TABLE:
+          Ref: MessagesTable
+        SALESFORCE_URL:
+          Ref: SalesforceUrl
+        ENVIRONMENT:
+          Ref: Environment
+Resources:
+  ConsumersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName:
+        Fn::Sub: webhook-consumers-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: api_key_hash
+        AttributeType: S
+      KeySchema:
+      - AttributeName: api_key_hash
+        KeyType: HASH
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName:
+        Fn::Sub: webhook-idempotency-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: idempotency_key
+        AttributeType: S
+      KeySchema:
+      - AttributeName: idempotency_key
+        KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+  MessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName:
+        Fn::Sub: webhook-messages-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: message_id
+        AttributeType: S
+      KeySchema:
+      - AttributeName: message_id
+        KeyType: HASH
+  OrderMgmtDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName:
+        Fn::Sub: order-mgmt-dlq-${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: 1209600
+  OrderMgmtP1:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName:
+        Fn::Sub: order-mgmt-p1-${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn:
+          Fn::GetAtt:
+          - OrderMgmtDLQ
+          - Arn
+        maxReceiveCount: 5
+  OrderMgmtP2:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName:
+        Fn::Sub: order-mgmt-p2-${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn:
+          Fn::GetAtt:
+          - OrderMgmtDLQ
+          - Arn
+        maxReceiveCount: 5
+  OrderMgmtP3:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName:
+        Fn::Sub: order-mgmt-p3-${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn:
+          Fn::GetAtt:
+          - OrderMgmtDLQ
+          - Arn
+        maxReceiveCount: 5
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: webhook-lambda-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: WebhookServicePolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:Query
+            - dynamodb:Scan
+            Resource:
+            - Fn::GetAtt:
+              - ConsumersTable
+              - Arn
+            - Fn::GetAtt:
+              - IdempotencyTable
+              - Arn
+            - Fn::GetAtt:
+              - MessagesTable
+              - Arn
+          - Effect: Allow
+            Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+            - sqs:GetQueueUrl
+            Resource:
+            - Fn::GetAtt:
+              - OrderMgmtP1
+              - Arn
+            - Fn::GetAtt:
+              - OrderMgmtP2
+              - Arn
+            - Fn::GetAtt:
+              - OrderMgmtP3
+              - Arn
+            - Fn::GetAtt:
+              - OrderMgmtDLQ
+              - Arn
+  AuthoriserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: webhook-authoriser-${Environment}
+      CodeUri: AuthoriserFunction
+      Handler: authoriser.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - LambdaExecutionRole
+        - Arn
+      Timeout: 10
+      Description: Validates API keys for incoming webhook requests
+    Metadata:
+      SamResourceId: AuthoriserFunction
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: webhook-ingest-${Environment}
+      CodeUri: IngestFunction
+      Handler: ingest_handler.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - LambdaExecutionRole
+        - Arn
+      Timeout: 30
+      Description: Receives webhooks and routes to priority queues
+      Events:
+        WebhookPost:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: WebhookApi
+            Path: /webhooks
+            Method: POST
+    Metadata:
+      SamResourceId: IngestFunction
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: webhook-processor-${Environment}
+      CodeUri: ProcessorFunction
+      Handler: processor.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - LambdaExecutionRole
+        - Arn
+      Timeout: 60
+      Description: Processes queued webhooks and delivers to Salesforce
+      Events:
+        P1Trigger:
+          Type: SQS
+          Properties:
+            Queue:
+              Fn::GetAtt:
+              - OrderMgmtP1
+              - Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+            - ReportBatchItemFailures
+        P2Trigger:
+          Type: SQS
+          Properties:
+            Queue:
+              Fn::GetAtt:
+              - OrderMgmtP2
+              - Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+            - ReportBatchItemFailures
+        P3Trigger:
+          Type: SQS
+          Properties:
+            Queue:
+              Fn::GetAtt:
+              - OrderMgmtP3
+              - Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+            - ReportBatchItemFailures
+    Metadata:
+      SamResourceId: ProcessorFunction
+  WebhookApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name:
+        Fn::Sub: webhook-service-${Environment}
+      StageName:
+        Ref: Environment
+      Description: Central Webhook Service API
+      Auth:
+        DefaultAuthorizer: WebhookKeyAuthoriser
+        Authorizers:
+          WebhookKeyAuthoriser:
+            FunctionArn:
+              Fn::GetAtt:
+              - AuthoriserFunction
+              - Arn
+            Identity:
+              Header: X-API-Key
+              ReauthorizeEvery: 300
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value:
+      Fn::Sub: https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/webhooks
+  AuthoriserFunctionArn:
+    Description: Lambda Authoriser ARN
+    Value:
+      Fn::GetAtt:
+      - AuthoriserFunction
+      - Arn
+  IngestFunctionArn:
+    Description: Ingest Lambda ARN
+    Value:
+      Fn::GetAtt:
+      - IngestFunction
+      - Arn
+  ProcessorFunctionArn:
+    Description: Processor Lambda ARN
+    Value:
+      Fn::GetAtt:
+      - ProcessorFunction
+      - Arn
+  ConsumersTableName:
+    Description: DynamoDB consumers table name
+    Value:
+      Ref: ConsumersTable
+  P1QueueUrl:
+    Description: SQS P1 queue URL
+    Value:
+      Ref: OrderMgmtP1
+  DLQUrl:
+    Description: Dead letter queue URL
+    Value:
+      Ref: OrderMgmtDLQ
