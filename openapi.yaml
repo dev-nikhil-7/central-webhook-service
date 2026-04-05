@@ -1,0 +1,257 @@
+openapi: 3.0.3
+
+info:
+  title:       Central Webhook Service
+  description: |
+    Receives webhook notifications from multiple source systems,
+    queues them with priority ordering, enriches the payload with
+    customer and product data, and delivers to Salesforce.
+  version:     1.0.0
+
+servers:
+  - url:         https://oaf8rg5ie3.execute-api.us-east-1.amazonaws.com/dev/webhooks
+    description: AWS API Gateway
+    variables:
+      apiId:
+        default: api-id
+      region:
+        default: us-east-1
+      stage:
+        default: dev
+
+# ─── Security ─────────────────────────────────────────────────────────────────
+# Every request must include X-API-Key header.
+# API Gateway validates this via Lambda authoriser.
+
+security:
+  - ApiKeyAuth: []
+
+components:
+
+  securitySchemes:
+    ApiKeyAuth:
+      type:        apiKey
+      in:          header
+      name:        X-API-Key
+      description: |
+        API key issued at consumer registration.
+        Stored as SHA-256 hash in DynamoDB — raw key never stored.
+        Returned once at registration and cannot be retrieved again.
+
+  schemas:
+
+    # ── Request ───────────────────────────────────────────────────────────────
+
+    WebhookRequest:
+      type:     object
+      required: [object_type, object_id, event_type, priority, payload]
+      properties:
+
+        object_type:
+          type:        string
+          enum:        [sales_order, inventory_update]
+          description: Type of business object that changed
+          example:     sales_order
+
+        object_id:
+          type:        string
+          minLength:   1
+          description: Unique identifier of the object in the source system
+          example:     ORD-20240501-001
+
+        event_type:
+          type:        string
+          minLength:   1
+          description: What happened to the object
+          example:     order.status_changed
+
+        priority:
+          type:        integer
+          enum:        [1, 2, 3]
+          description: |
+            Processing priority.
+            1 = Critical — processed first, reserved concurrency 10
+            2 = Normal   — processed if P1 empty, reserved concurrency 5
+            3 = Low      — processed if P1 and P2 empty, concurrency 2
+          example:     1
+
+        payload:
+          type:        object
+          description: Event-specific data. Shape varies by object_type.
+          example:
+            status:      shipped
+            customer_id: CUST-42
+            line_items:
+              - product_id: PROD-001
+                qty:        2
+
+        idempotency_key:
+          type:        string
+          description: |
+            Optional. Unique key identifying this business event.
+            If not provided, one is built from consumer_id + object_id + event_type.
+            Submit the same key twice — second request returns 409.
+          example:     order-mgmt:ORD-001:order.status_changed
+
+    # ── Responses ─────────────────────────────────────────────────────────────
+
+    AcceptedResponse:
+      type:     object
+      properties:
+        message_id:
+          type:        string
+          description: Internal ID assigned to this message
+          example:     msg_a1b2c3d4e5f6
+        correlation_id:
+          type:        string
+          description: |
+            API Gateway requestId. Flows through every log line
+            for this request. Use to trace end to end in CloudWatch.
+          example:     abc-123-xyz-456
+        status:
+          type:        string
+          enum:        [queued]
+          example:     queued
+
+    ErrorResponse:
+      type:     object
+      properties:
+        error:
+          type:    string
+          example: INVALID_PRIORITY
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+
+paths:
+
+  /webhooks:
+    post:
+      summary:     Submit a webhook event
+      description: |
+        Receives a webhook notification from a source system.
+        Validates the request, checks idempotency, and enqueues
+        to the correct SQS priority queue.
+        Returns 202 immediately — does not wait for processing or delivery.
+      operationId: submitWebhook
+      tags:        [Webhooks]
+
+      parameters:
+        - name:        X-Consumer-ID
+          in:          header
+          required:    false
+          description: Consumer identifier. Informational — consumer_id is read from authoriser context.
+          schema:
+            type:    string
+            example: order-mgmt
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookRequest'
+            examples:
+
+              sales_order:
+                summary: Order status changed
+                value:
+                  object_type: sales_order
+                  object_id:   ORD-20240501-001
+                  event_type:  order.status_changed
+                  priority:    1
+                  payload:
+                    status:      shipped
+                    customer_id: CUST-42
+                    line_items:
+                      - product_id: PROD-001
+                        qty:        2
+                      - product_id: PROD-047
+                        qty:        1
+
+              inventory_update:
+                summary: Inventory level changed
+                value:
+                  object_type: inventory_update
+                  object_id:   INV-20240501-007
+                  event_type:  inventory.level_changed
+                  priority:    2
+                  payload:
+                    warehouse_id: WH-001
+                    sku_id:       SKU-ABC
+                    quantity:     150
+                    previous:     200
+
+              with_idempotency_key:
+                summary: With explicit idempotency key
+                value:
+                  object_type:     sales_order
+                  object_id:       ORD-20240501-001
+                  event_type:      order.status_changed
+                  priority:        1
+                  idempotency_key: order-mgmt:ORD-001:order.status_changed
+                  payload:
+                    status: shipped
+
+      responses:
+
+        '202':
+          description: |
+            Accepted. Message queued for processing.
+            Does not mean delivered — processing is asynchronous.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedResponse'
+              example:
+                message_id:     msg_a1b2c3d4e5f6
+                correlation_id: abc-123-xyz-456
+                status:         queued
+
+        '400':
+          description: Invalid request — failed schema validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalid_priority:
+                  value:
+                    error: INVALID_PRIORITY
+                invalid_object_type:
+                  value:
+                    error: INVALID_OBJECT_TYPE
+                missing_fields:
+                  value:
+                    error: MISSING_FIELDS
+
+        '401':
+          description: |
+            Unauthorised. API key missing or invalid.
+            Returned by API Gateway before Lambda is invoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                message: Unauthorized
+
+        '409':
+          description: |
+            Duplicate event. Same idempotency key already received.
+            Safe to ignore — original message is already queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: DUPLICATE
+
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: INTERNAL_ERROR
+
